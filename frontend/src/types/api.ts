@@ -172,6 +172,10 @@ export interface LyricsDownloadRequest {
   track_name: string;
   artist_name: string;
   output_dir?: string;
+  filename_format?: string;
+  track_number?: boolean;
+  position?: number;
+  use_album_track_number?: boolean;
 }
 
 export interface LyricsDownloadResponse {
@@ -180,6 +184,41 @@ export interface LyricsDownloadResponse {
   file?: string;
   error?: string;
   already_exists?: boolean;
+}
+
+export interface TrackAvailability {
+  spotify_id: string;
+  tidal: boolean;
+  deezer: boolean;
+  amazon: boolean;
+  qobuz: boolean;
+  tidal_url?: string;
+  deezer_url?: string;
+  amazon_url?: string;
+  qobuz_url?: string;
+}
+
+export interface TrackCheckRequest {
+  isrc: string;
+  track_name: string;
+  artist_name: string;
+  album_name: string;
+  position: number;
+}
+
+export interface ExistingTrackInfo {
+  isrc: string;
+  filename: string;
+  path: string;
+  size_gb: number;
+}
+
+export interface PreCheckDownloadRequest {
+  tracks: TrackCheckRequest[];
+  output_dir: string;
+  filename_format: string;
+  track_number: boolean;
+  use_album_track_number: boolean;
 }
 
 

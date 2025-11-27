@@ -1,6 +1,8 @@
 module spotiflac
 
-go 1.25.4
+go 1.24.0
+
+toolchain go1.24.10
 
 require (
 	github.com/go-flac/flacpicture v0.3.0
