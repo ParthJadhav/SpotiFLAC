@@ -7,7 +7,7 @@ import type {
   LyricsDownloadResponse,
 } from "@/types/api";
 import { GetSpotifyMetadata, DownloadTrack as DownloadTrackFn, DownloadLyrics, PreCheckDownloadFiles as PreCheckDownloadFilesFn } from "../../wailsjs/go/main/App";
-import { main } from "../../wailsjs/go/models";
+import { backend, main } from "../../wailsjs/go/models";
 
 export async function fetchSpotifyMetadata(
   url: string,
@@ -29,7 +29,8 @@ export async function fetchSpotifyMetadata(
 export async function downloadTrack(
   request: DownloadRequest
 ): Promise<DownloadResponse> {
-  return await DownloadTrackFn(request as any) as DownloadResponse;
+  const req = new backend.DownloadRequest(request);
+  return await DownloadTrackFn(req);
 }
 
 export async function checkHealth(): Promise<HealthResponse> {
@@ -45,7 +46,7 @@ export async function downloadLyrics(
   request: LyricsDownloadRequest
 ): Promise<LyricsDownloadResponse> {
   const req = new main.LyricsDownloadRequest(request);
-  return await DownloadLyrics(req) as LyricsDownloadResponse;
+  return await DownloadLyrics(req);
 }
 
 export async function preCheckDownloadFiles(
@@ -55,12 +56,12 @@ export async function preCheckDownloadFiles(
   trackNumber: boolean,
   useAlbumTrackNumber: boolean
 ): Promise<string> {
-  const req = new main.PreCheckDownloadRequest({
+  const req = {
     tracks,
     output_dir: outputDir,
     filename_format: filenameFormat,
     track_number: trackNumber,
     use_album_track_number: useAlbumTrackNumber,
-  });
-  return await PreCheckDownloadFilesFn(req);
+  };
+  return await PreCheckDownloadFilesFn(req as any);
 }
