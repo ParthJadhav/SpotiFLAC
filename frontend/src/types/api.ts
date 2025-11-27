@@ -198,4 +198,27 @@ export interface TrackAvailability {
   qobuz_url?: string;
 }
 
+export interface TrackCheckRequest {
+  isrc: string;
+  track_name: string;
+  artist_name: string;
+  album_name: string;
+  position: number;
+}
+
+export interface ExistingTrackInfo {
+  isrc: string;
+  filename: string;
+  path: string;
+  size_gb: number;
+}
+
+export interface PreCheckDownloadRequest {
+  tracks: TrackCheckRequest[];
+  output_dir: string;
+  filename_format: string;
+  track_number: boolean;
+  use_album_track_number: boolean;
+}
+
 

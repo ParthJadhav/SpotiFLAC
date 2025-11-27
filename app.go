@@ -4,16 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"spotiflac/backend"
 	"strings"
+	"sync"
 	"time"
 )
 
 // App struct
 type App struct {
-	ctx context.Context
+	ctx                    context.Context
+	parallelDownloadLock   sync.Mutex
 }
 
 // NewApp creates a new App application struct
@@ -33,26 +33,6 @@ type SpotifyMetadataRequest struct {
 	Batch   bool    `json:"batch"`
 	Delay   float64 `json:"delay"`
 	Timeout float64 `json:"timeout"`
-}
-
-// DownloadRequest represents the request structure for downloading tracks
-type DownloadRequest struct {
-	ISRC                string `json:"isrc"`
-	Service             string `json:"service"`
-	Query               string `json:"query,omitempty"`
-	TrackName           string `json:"track_name,omitempty"`
-	ArtistName          string `json:"artist_name,omitempty"`
-	AlbumName           string `json:"album_name,omitempty"`
-	ApiURL              string `json:"api_url,omitempty"`
-	OutputDir           string `json:"output_dir,omitempty"`
-	AudioFormat         string `json:"audio_format,omitempty"`
-	FilenameFormat      string `json:"filename_format,omitempty"`
-	TrackNumber         bool   `json:"track_number,omitempty"`
-	Position            int    `json:"position,omitempty"`               // Position in playlist/album (1-based)
-	UseAlbumTrackNumber bool   `json:"use_album_track_number,omitempty"` // Use album track number instead of playlist position
-	SpotifyID           string `json:"spotify_id,omitempty"`             // Spotify track ID
-	ServiceURL          string `json:"service_url,omitempty"`            // Direct service URL (Tidal/Deezer/Amazon) to skip song.link API call
-	Duration            int    `json:"duration,omitempty"`               // Track duration in seconds for better matching
 }
 
 // DownloadResponse represents the response structure for download operations
@@ -115,7 +95,7 @@ func (a *App) GetSpotifyMetadata(req SpotifyMetadataRequest) (string, error) {
 }
 
 // DownloadTrack downloads a track by ISRC
-func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
+func (a *App) DownloadTrack(req backend.DownloadRequest) (DownloadResponse, error) {
 	if req.ISRC == "" {
 		return DownloadResponse{
 			Success: false,
@@ -143,35 +123,46 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 		req.FilenameFormat = "title-artist"
 	}
 
-	// Early check: Check if file with same ISRC already exists
-	if existingFile, exists := backend.CheckISRCExists(req.OutputDir, req.ISRC); exists {
-		fmt.Printf("File with ISRC %s already exists: %s\n", req.ISRC, existingFile)
-		return DownloadResponse{
-			Success:       true,
-			Message:       "File with same ISRC already exists",
-			File:          existingFile,
-			AlreadyExists: true,
-		}, nil
-	}
-
-	// Fallback: if we have track metadata, check if file already exists by filename
+	// Primary check: Check if file with expected filename already exists
 	if req.TrackName != "" && req.ArtistName != "" {
 		expectedFilename := backend.BuildExpectedFilename(req.TrackName, req.ArtistName, req.FilenameFormat, req.TrackNumber, req.Position, req.UseAlbumTrackNumber)
-		expectedPath := filepath.Join(req.OutputDir, expectedFilename)
-
-		if fileInfo, err := os.Stat(expectedPath); err == nil && fileInfo.Size() > 0 {
+		if existingFile, exists := backend.CheckFilenameExists(req.OutputDir, expectedFilename); exists {
+			fmt.Printf("File with filename %s already exists: %s\n", expectedFilename, existingFile)
 			return DownloadResponse{
 				Success:       true,
 				Message:       "File already exists",
-				File:          expectedPath,
+				File:          existingFile,
 				AlreadyExists: true,
 			}, nil
 		}
 	}
 
+	// Fallback check: Check if file with same ISRC already exists (for backward compatibility)
+	if existingFile, exists := backend.CheckISRCExists(req.OutputDir, req.ISRC); exists {
+		fmt.Printf("File with ISRC %s already exists: %s\n", req.ISRC, existingFile)
+		return DownloadResponse{
+			Success:       true,
+			Message:       "File with same ISRC already exists (found by ISRC)",
+			File:          existingFile,
+			AlreadyExists: true,
+		}, nil
+	}
+
 	// Set downloading state
 	backend.SetDownloading(true)
 	defer backend.SetDownloading(false)
+
+	// Verbose logging for debugging
+	fmt.Printf("\n=== DOWNLOAD START ===\n")
+	fmt.Printf("ISRC: %s\n", req.ISRC)
+	fmt.Printf("Service: %s\n", req.Service)
+	fmt.Printf("Track: %s - %s\n", req.TrackName, req.ArtistName)
+	fmt.Printf("Album: %s\n", req.AlbumName)
+	fmt.Printf("Spotify ID: %s\n", req.SpotifyID)
+	fmt.Printf("Service URL: %s\n", req.ServiceURL)
+	fmt.Printf("Output Dir: %s\n", req.OutputDir)
+	fmt.Printf("Duration: %d ms\n", req.Duration)
+	fmt.Printf("======================\n")
 
 	switch req.Service {
 	case "amazon":
@@ -243,6 +234,12 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 	}
 
 	if err != nil {
+		fmt.Printf("\n=== DOWNLOAD FAILED ===\n")
+		fmt.Printf("Error: %v\n", err)
+		fmt.Printf("Service: %s\n", req.Service)
+		fmt.Printf("Track: %s - %s\n", req.TrackName, req.ArtistName)
+		fmt.Printf("ISRC: %s\n", req.ISRC)
+		fmt.Printf("=======================\n")
 		return DownloadResponse{
 			Success: false,
 			Error:   fmt.Sprintf("Download failed: %v", err),
@@ -254,12 +251,29 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 	if strings.HasPrefix(filename, "EXISTS:") {
 		alreadyExists = true
 		filename = strings.TrimPrefix(filename, "EXISTS:")
+		fmt.Printf("✓ File already existed: %s\n", filename)
+	} else {
+		fmt.Printf("✓ Download completed: %s\n", filename)
+	}
+
+	// Mark track as completed after successful download or if it already existed
+	if req.TrackName != "" && req.ArtistName != "" {
+		if err := backend.MarkTrackCompleted(req.OutputDir, req.TrackName, req.ArtistName, req.FilenameFormat, req.TrackNumber, req.Position, req.UseAlbumTrackNumber); err != nil {
+			fmt.Printf("Warning: Failed to mark track as completed: %v\n", err)
+		} else {
+			fmt.Printf("✓ Track marked as completed\n")
+		}
 	}
 
 	message := "Download completed successfully"
 	if alreadyExists {
 		message = "File already exists"
 	}
+
+	fmt.Printf("\n=== DOWNLOAD SUCCESS ===\n")
+	fmt.Printf("Final file: %s\n", filename)
+	fmt.Printf("Already existed: %v\n", alreadyExists)
+	fmt.Printf("========================\n")
 
 	return DownloadResponse{
 		Success:       true,
@@ -418,3 +432,38 @@ func (a *App) CheckTrackAvailability(spotifyTrackID string, isrc string) (string
 
 	return string(jsonData), nil
 }
+
+// PreCheckDownloadRequest represents the request for pre-checking files
+type PreCheckDownloadRequest struct {
+	Tracks              []backend.TrackCheckRequest `json:"tracks"`
+	OutputDir           string                      `json:"output_dir"`
+	FilenameFormat      string                      `json:"filename_format"`
+	TrackNumber         bool                        `json:"track_number"`
+	UseAlbumTrackNumber bool                        `json:"use_album_track_number"`
+}
+
+// PreCheckDownloadFiles checks if multiple files already exist before downloading
+// Returns list of existing files that can be skipped
+func (a *App) PreCheckDownloadFiles(req PreCheckDownloadRequest) (string, error) {
+	if len(req.Tracks) == 0 {
+		return "[]", nil
+	}
+
+	if req.OutputDir == "" {
+		req.OutputDir = "."
+	}
+
+	if req.FilenameFormat == "" {
+		req.FilenameFormat = "title-artist"
+	}
+
+	existing := backend.CheckFilesExistBatch(req.OutputDir, req.Tracks, req.FilenameFormat, req.TrackNumber, req.UseAlbumTrackNumber)
+
+	jsonData, err := json.Marshal(existing)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+

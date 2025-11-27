@@ -2,6 +2,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Settings } from "@/components/Settings";
 import { AudioAnalysisDialog } from "@/components/AudioAnalysisDialog";
+import { DownloadLogger } from "@/components/DownloadLogger";
 import {
   Tooltip,
   TooltipContent,
@@ -74,6 +75,7 @@ export function Header({ version, hasUpdate }: HeaderProps) {
           </TooltipContent>
         </Tooltip>
         <AudioAnalysisDialog />
+        <DownloadLogger />
         <Settings />
       </div>
     </div>

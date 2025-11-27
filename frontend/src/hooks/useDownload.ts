@@ -1,10 +1,10 @@
 import { useState, useRef } from "react";
-import { downloadTrack } from "@/lib/api";
+import { downloadTrack, preCheckDownloadFiles } from "@/lib/api";
 import { getSettings } from "@/lib/settings";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { joinPath, sanitizePath } from "@/lib/utils";
 import { logger } from "@/lib/logger";
-import type { TrackMetadata } from "@/types/api";
+import type { TrackMetadata, ExistingTrackInfo } from "@/types/api";
 
 export function useDownload() {
   const [downloadProgress, setDownloadProgress] = useState<number>(0);
@@ -19,6 +19,63 @@ export function useDownload() {
     artists: string;
   } | null>(null);
   const shouldStopDownloadRef = useRef(false);
+
+  // Pre-check if files already exist before downloading
+  const preCheckExistingFiles = async (
+    tracks: TrackMetadata[],
+    outputDir: string,
+    filenameFormat: string,
+    trackNumber: boolean,
+    useAlbumTrackNumber: boolean
+  ): Promise<Set<string>> => {
+    if (!tracks || tracks.length === 0) return new Set();
+
+    try {
+      const checkRequests = tracks.map((track, index) => ({
+        isrc: track.isrc,
+        track_name: track.name,
+        artist_name: track.artists,
+        album_name: track.album_name,
+        position: index + 1,
+      }));
+
+      const responseJson = await preCheckDownloadFiles(
+        checkRequests,
+        outputDir,
+        filenameFormat,
+        trackNumber,
+        useAlbumTrackNumber
+      );
+
+      const existing: ExistingTrackInfo[] = JSON.parse(responseJson);
+      // Use filename-based tracking instead of ISRC
+      const existingTrackIds = new Set<string>();
+      
+      for (const file of existing) {
+        // Find the corresponding track by checking track name and artist
+        const matchingTrack = tracks.find(track => {
+          const expectedFilename = `${track.name} - ${track.artists}.flac`;
+          return file.filename === expectedFilename || file.isrc === track.isrc;
+        });
+        
+        if (matchingTrack) {
+          // Use a combination of track name and artist as unique identifier
+          const trackId = `${matchingTrack.name}|||${matchingTrack.artists}`;
+          existingTrackIds.add(trackId);
+        }
+      }
+
+      if (existingTrackIds.size > 0) {
+        logger.info(`Pre-check found ${existingTrackIds.size} existing files`);
+      }
+
+      return existingTrackIds;
+    } catch (err) {
+      logger.warning(`Pre-check failed: ${err}. Proceeding with sequential check.`);
+      return new Set();
+    }
+  };
+
 
   const downloadWithAutoFallback = async (
     isrc: string,
@@ -209,7 +266,7 @@ export function useDownload() {
 
     logger.info(`starting download: ${trackName} - ${artistName}`);
     const settings = getSettings();
-    setDownloadingTrack(isrc);
+    setDownloadingTrack(isrc); // Use ISRC for UI compatibility
 
     try {
       // Single track download - use playlistName if provided for folder structure
@@ -229,23 +286,23 @@ export function useDownload() {
       if (response.success) {
         if (response.already_exists) {
           toast.info(response.message);
-          setSkippedTracks((prev) => new Set(prev).add(isrc));
+          setSkippedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
         } else {
           toast.success(response.message);
         }
-        setDownloadedTracks((prev) => new Set(prev).add(isrc));
+        setDownloadedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
         setFailedTracks((prev) => {
           const newSet = new Set(prev);
-          newSet.delete(isrc);
+          newSet.delete(isrc); // Use ISRC for UI compatibility
           return newSet;
         });
       } else {
         toast.error(response.error || "Download failed");
-        setFailedTracks((prev) => new Set(prev).add(isrc));
+        setFailedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Download failed");
-      setFailedTracks((prev) => new Set(prev).add(isrc));
+      setFailedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
     } finally {
       setDownloadingTrack(null);
     }
@@ -268,9 +325,36 @@ export function useDownload() {
     setBulkDownloadType("selected");
     setDownloadProgress(0);
 
+    // Determine output directory
+    let outputDir = settings.downloadPath;
+    let useAlbumTrackNumber = false;
+
+    if (playlistName) {
+      outputDir = joinPath(settings.operatingSystem, outputDir, sanitizePath(playlistName, settings.operatingSystem));
+      
+      if (isArtistDiscography) {
+        const firstTrack = allTracks.find((t) => selectedTracks.includes(t.isrc));
+        if (settings.albumSubfolder && firstTrack?.album_name) {
+          outputDir = joinPath(settings.operatingSystem, outputDir, sanitizePath(firstTrack.album_name, settings.operatingSystem));
+          useAlbumTrackNumber = true;
+        }
+      }
+    }
+
+    // PRE-CHECK: Get existing files quickly
+    const selectedTrackObjects = selectedTracks.map((isrc) => allTracks.find((t) => t.isrc === isrc)).filter(Boolean) as TrackMetadata[];
+    logger.info("Pre-checking for existing files...");
+    const existingTrackIds = await preCheckExistingFiles(
+      selectedTrackObjects,
+      outputDir,
+      settings.filenameFormat,
+      settings.trackNumber,
+      useAlbumTrackNumber
+    );
+
     let successCount = 0;
     let errorCount = 0;
-    let skippedCount = 0;
+    let skippedCount = existingTrackIds.size;
     const total = selectedTracks.length;
 
     for (let i = 0; i < selectedTracks.length; i++) {
@@ -284,7 +368,37 @@ export function useDownload() {
       const isrc = selectedTracks[i];
       const track = allTracks.find((t) => t.isrc === isrc);
 
-      setDownloadingTrack(isrc);
+      // Skip if already exists from pre-check
+      const trackId = track ? `${track.name}|||${track.artists}` : '';
+      if (trackId && existingTrackIds.has(trackId)) {
+        logger.info(`skipped (pre-check): ${track?.name} - ${track?.artists} (already exists)`);
+        setSkippedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
+        setDownloadProgress(Math.round(((i + 1) / total) * 100));
+        
+        // Emit download event
+        window.dispatchEvent(new CustomEvent('download-skipped', {
+          detail: {
+            trackName: track?.name || 'Unknown',
+            artistName: track?.artists || 'Unknown',
+            reason: 'File already exists (pre-check)'
+          }
+        }));
+        
+        continue;
+      }
+
+      setDownloadingTrack(isrc); // Use ISRC for UI compatibility
+      
+      // Emit download start event
+      if (track) {
+        window.dispatchEvent(new CustomEvent('download-start', {
+          detail: {
+            trackName: track.name,
+            artistName: track.artists,
+            service: settings.downloader
+          }
+        }));
+      }
 
       if (track) {
         setCurrentDownloadInfo({ name: track.name, artists: track.artists });
@@ -309,26 +423,62 @@ export function useDownload() {
           if (response.already_exists) {
             skippedCount++;
             logger.info(`skipped: ${track?.name} - ${track?.artists} (already exists)`);
-            setSkippedTracks((prev) => new Set(prev).add(isrc));
+            setSkippedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
+            
+            // Emit skip event
+            window.dispatchEvent(new CustomEvent('download-skipped', {
+              detail: {
+                trackName: track?.name || 'Unknown',
+                artistName: track?.artists || 'Unknown',
+                reason: 'File already exists'
+              }
+            }));
           } else {
             successCount++;
             logger.success(`downloaded: ${track?.name} - ${track?.artists}`);
+            
+            // Emit success event
+            window.dispatchEvent(new CustomEvent('download-success', {
+              detail: {
+                trackName: track?.name || 'Unknown',
+                artistName: track?.artists || 'Unknown',
+                filename: response.file || 'Unknown'
+              }
+            }));
           }
-          setDownloadedTracks((prev) => new Set(prev).add(isrc));
+          setDownloadedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
           setFailedTracks((prev) => {
             const newSet = new Set(prev);
-            newSet.delete(isrc); // Remove from failed if it was there
+            newSet.delete(isrc); // Use ISRC for UI compatibility
             return newSet;
           });
         } else {
           errorCount++;
           logger.error(`failed: ${track?.name} - ${track?.artists}`);
-          setFailedTracks((prev) => new Set(prev).add(isrc));
+          setFailedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
+          
+          // Emit error event
+          window.dispatchEvent(new CustomEvent('download-error', {
+            detail: {
+              trackName: track?.name || 'Unknown',
+              artistName: track?.artists || 'Unknown',
+              error: response.error || 'Unknown error'
+            }
+          }));
         }
       } catch (err) {
         errorCount++;
         logger.error(`error: ${track?.name} - ${err}`);
-        setFailedTracks((prev) => new Set(prev).add(isrc));
+        setFailedTracks((prev) => new Set(prev).add(isrc)); // Use ISRC for UI compatibility
+        
+        // Emit error event
+        window.dispatchEvent(new CustomEvent('download-error', {
+          detail: {
+            trackName: track?.name || 'Unknown',
+            artistName: track?.artists || 'Unknown',
+            error: err instanceof Error ? err.message : 'Unknown error'
+          }
+        }));
       }
 
       setDownloadProgress(Math.round(((i + 1) / total) * 100));
@@ -345,13 +495,10 @@ export function useDownload() {
     if (errorCount === 0 && skippedCount === 0) {
       toast.success(`Downloaded ${successCount} tracks successfully`);
     } else if (errorCount === 0 && successCount === 0) {
-      // All skipped
       toast.info(`${skippedCount} tracks already exist`);
     } else if (errorCount === 0) {
-      // Mix of downloaded and skipped
       toast.info(`${successCount} downloaded, ${skippedCount} skipped`);
     } else {
-      // Has errors
       const parts = [];
       if (successCount > 0) parts.push(`${successCount} downloaded`);
       if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
@@ -378,9 +525,34 @@ export function useDownload() {
     setBulkDownloadType("all");
     setDownloadProgress(0);
 
+    // Determine output directory
+    let outputDir = settings.downloadPath;
+    let useAlbumTrackNumber = false;
+
+    if (playlistName) {
+      outputDir = joinPath(settings.operatingSystem, outputDir, sanitizePath(playlistName, settings.operatingSystem));
+      
+      if (isArtistDiscography) {
+        if (settings.albumSubfolder && tracksWithIsrc[0]?.album_name) {
+          outputDir = joinPath(settings.operatingSystem, outputDir, sanitizePath(tracksWithIsrc[0].album_name, settings.operatingSystem));
+          useAlbumTrackNumber = true;
+        }
+      }
+    }
+
+    // PRE-CHECK: Get existing files quickly before starting downloads
+    logger.info("Pre-checking for existing files...");
+    const existingTrackIds = await preCheckExistingFiles(
+      tracksWithIsrc,
+      outputDir,
+      settings.filenameFormat,
+      settings.trackNumber,
+      useAlbumTrackNumber
+    );
+
     let successCount = 0;
     let errorCount = 0;
-    let skippedCount = 0;
+    let skippedCount = existingTrackIds.size; // Pre-counted existing files
     const total = tracksWithIsrc.length;
 
     for (let i = 0; i < tracksWithIsrc.length; i++) {
@@ -392,8 +564,17 @@ export function useDownload() {
       }
 
       const track = tracksWithIsrc[i];
+      const trackId = `${track.name}|||${track.artists}`;
 
-      setDownloadingTrack(track.isrc);
+      // Skip if already exists from pre-check
+      if (existingTrackIds.has(trackId)) {
+        logger.info(`skipped (pre-check): ${track.name} - ${track.artists} (already exists)`);
+        setSkippedTracks((prev) => new Set(prev).add(track.isrc)); // Use ISRC for UI compatibility
+        setDownloadProgress(Math.round(((i + 1) / total) * 100));
+        continue;
+      }
+
+      setDownloadingTrack(track.isrc); // Use ISRC for UI compatibility
       setCurrentDownloadInfo({ name: track.name, artists: track.artists });
 
       try {
@@ -414,26 +595,26 @@ export function useDownload() {
           if (response.already_exists) {
             skippedCount++;
             logger.info(`skipped: ${track.name} - ${track.artists} (already exists)`);
-            setSkippedTracks((prev) => new Set(prev).add(track.isrc));
+            setSkippedTracks((prev) => new Set(prev).add(track.isrc)); // Use ISRC for UI compatibility
           } else {
             successCount++;
             logger.success(`downloaded: ${track.name} - ${track.artists}`);
           }
-          setDownloadedTracks((prev) => new Set(prev).add(track.isrc));
+          setDownloadedTracks((prev) => new Set(prev).add(track.isrc)); // Use ISRC for UI compatibility
           setFailedTracks((prev) => {
             const newSet = new Set(prev);
-            newSet.delete(track.isrc); // Remove from failed if it was there
+            newSet.delete(track.isrc); // Use ISRC for UI compatibility
             return newSet;
           });
         } else {
           errorCount++;
           logger.error(`failed: ${track.name} - ${track.artists}`);
-          setFailedTracks((prev) => new Set(prev).add(track.isrc));
+          setFailedTracks((prev) => new Set(prev).add(track.isrc)); // Use ISRC for UI compatibility
         }
       } catch (err) {
         errorCount++;
         logger.error(`error: ${track.name} - ${err}`);
-        setFailedTracks((prev) => new Set(prev).add(track.isrc));
+        setFailedTracks((prev) => new Set(prev).add(track.isrc)); // Use ISRC for UI compatibility
       }
 
       setDownloadProgress(Math.round(((i + 1) / total) * 100));
@@ -450,13 +631,10 @@ export function useDownload() {
     if (errorCount === 0 && skippedCount === 0) {
       toast.success(`Downloaded ${successCount} tracks successfully`);
     } else if (errorCount === 0 && successCount === 0) {
-      // All skipped
       toast.info(`${skippedCount} tracks already exist`);
     } else if (errorCount === 0) {
-      // Mix of downloaded and skipped
       toast.info(`${successCount} downloaded, ${skippedCount} skipped`);
     } else {
-      // Has errors
       const parts = [];
       if (successCount > 0) parts.push(`${successCount} downloaded`);
       if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
